@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # SMART on FHIR Medical History Analyzer Agent (Anthropic Edition)
 
 This is a Python-based Agentic AI project designed to analyze a single patient's medical history using standard FHIR resources. 
@@ -86,3 +87,7 @@ The log file is created in the root directory. To audit the agent's chain of tho
    Thought: The patient has active diagnoses including Type 2 Diabetes... I must fetch the latest clinical observations (vitals and lab values)...
    Action (JSON-RPC): { "jsonrpc": "2.0", "method": "get_vitals", ... }
    ```
+=======
+# Medical
+Python-based Agentic AI project designed to analyse a single patient's medical history
+>>>>>>> 95415d286dea880cffd3611e5f5eafee4d91c6a1
