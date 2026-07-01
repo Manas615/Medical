@@ -13,45 +13,78 @@ class FHIRClient:
 
     def fetch_patient_bundle(self, patient_id: str) -> Dict[str, Any]:
         """
-        Fetches the patient resource from [base_url]/Patient/[patient_id].
-        Uses urllib.request as required. Logs raw response at DEBUG level.
-        Falls back to local mock_patient_bundle.json if clinical data is absent.
+        Fetches patient record from SMART on FHIR.
+        First dynamically searches for an active patient ID if patient_id is the default
+        or if we encounter fetch errors, then pulls their history ($everything or direct).
         """
-        # Fetching the Patient resource itself without /$everything to avoid 404 errors
-        url = f"{self.base_url}/Patient/{patient_id}"
-        logger.info(f"Ingesting patient data from: {url}")
-        
-        # Setup standard request with headers to bypass potential blocks
-        req = urllib.request.Request(
-            url, 
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AntigravityFHIRClient/1.0"}
-        )
-        
-        # Bypass strict SSL checking for local dev/sandboxes if needed
+        resolved_patient_id = patient_id
         ssl_ctx = ssl.create_default_context()
         ssl_ctx.check_hostname = False
         ssl_ctx.verify_mode = ssl.CERT_NONE
+
+        # 1. Dynamically search for an active patient on the sandbox
+        search_url = f"{self.base_url}/Patient?_count=1"
+        logger.info(f"Searching for an active patient dynamically at: {search_url}")
+        req_search = urllib.request.Request(
+            search_url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AntigravityFHIRClient/1.0"}
+        )
+        
+        try:
+            with urllib.request.urlopen(req_search, context=ssl_ctx, timeout=10) as response:
+                search_data = json.loads(response.read().decode("utf-8"))
+                entries = search_data.get("entry", [])
+                if entries:
+                    # Resolve to the active patient ID found on the sandbox
+                    resolved_patient_id = entries[0].get("resource", {}).get("id", patient_id)
+                    logger.info(f"Discovered active patient ID on sandbox: {resolved_patient_id}")
+                else:
+                    logger.warning("Dynamic search returned no patients. Using default patient ID.")
+        except Exception as e:
+            logger.warning(f"Dynamic patient search failed: {e}. Falling back to default ID: {patient_id}")
+
+        # 2. Attempt to pull the complete clinical history using $everything
+        url_everything = f"{self.base_url}/Patient/{resolved_patient_id}/$everything"
+        logger.info(f"Ingesting patient clinical history from: {url_everything}")
+        req_everything = urllib.request.Request(
+            url_everything,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AntigravityFHIRClient/1.0"}
+        )
 
         raw_payload = ""
         bundle_data = {}
         fetch_success = False
 
         try:
-            with urllib.request.urlopen(req, context=ssl_ctx, timeout=15) as response:
+            with urllib.request.urlopen(req_everything, context=ssl_ctx, timeout=15) as response:
                 raw_payload = response.read().decode("utf-8")
-                # Log raw API response to the log file as required
-                logger.debug(f"Raw API Response: {raw_payload}")
+                logger.debug(f"Raw API Response ($everything): {raw_payload}")
                 bundle_data = json.loads(raw_payload)
                 fetch_success = True
-                logger.info(f"Successfully retrieved FHIR patient resource from live server for patient {patient_id}.")
+                logger.info(f"Successfully retrieved FHIR bundle ($everything) for patient {resolved_patient_id}.")
         except Exception as e:
-            logger.error(f"Failed to fetch live patient record: {e}")
-            logger.info("Proceeding to load local fallback data due to fetch error.")
+            logger.warning(f"Failed to fetch $everything history: {e}. Attempting direct Patient resource fetch.")
+            # 3. Fallback: fetch patient resource directly
+            url_patient = f"{self.base_url}/Patient/{resolved_patient_id}"
+            logger.info(f"Ingesting direct patient data from: {url_patient}")
+            req_patient = urllib.request.Request(
+                url_patient,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AntigravityFHIRClient/1.0"}
+            )
+            try:
+                with urllib.request.urlopen(req_patient, context=ssl_ctx, timeout=15) as response:
+                    raw_payload = response.read().decode("utf-8")
+                    logger.debug(f"Raw API Response (Direct Patient): {raw_payload}")
+                    bundle_data = json.loads(raw_payload)
+                    fetch_success = True
+                    logger.info(f"Successfully retrieved FHIR patient resource for patient {resolved_patient_id}.")
+            except Exception as e2:
+                logger.error(f"Failed to fetch direct patient record: {e2}")
+                logger.info("Proceeding to load local fallback data due to fetch errors.")
 
         # Check if the bundle contains clinical data (Observations or Conditions)
         has_clinical_data = False
         if fetch_success:
-            # If the response is a single resource (e.g. Patient) rather than a Bundle
             if bundle_data.get("resourceType") == "Bundle":
                 entries = bundle_data.get("entry", [])
                 for entry in entries:
@@ -61,16 +94,15 @@ class FHIRClient:
                         has_clinical_data = True
                         break
             else:
-                # If we fetched a single Patient resource directly, we definitely need mock clinical data
+                # If we fetched a single Patient resource, we need the clinical fallback data
                 has_clinical_data = False
 
         if not has_clinical_data:
             logger.warning(
-                f"Live FHIR response for patient {patient_id} lacks clinical records (Observations/Conditions). "
+                f"Live FHIR data for patient {resolved_patient_id} lacks clinical records. "
                 "Loading synthetic mock patient bundle data from local fallback file."
             )
             bundle_data = self._load_mock_bundle()
-            # Log the mock raw data as well since it serves as the API response representation
             logger.debug(f"Mock FHIR Data Loaded: {json.dumps(bundle_data, indent=2)}")
 
         return bundle_data

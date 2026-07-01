@@ -394,10 +394,12 @@ class MedicalAgent:
         # A list of models to try in order of capability/preference.
         # This provides fallback options in case specific models are not supported on the user's account.
         models_to_try = [
-            "claude-3-5-haiku-20241022",   # Claude 3.5 Haiku (standard version)
-            "claude-3-5-haiku-latest",     # Claude 3.5 Haiku (latest alias)
+            "claude-haiku-4-5",            # Custom model name requested by the user
+            "claude-3-5-sonnet-latest",    # Claude 3.5 Sonnet (latest alias)
             "claude-3-5-sonnet-20241022",  # Claude 3.5 Sonnet v2
             "claude-3-5-sonnet-20240620",  # Claude 3.5 Sonnet v1
+            "claude-3-5-haiku-20241022",   # Claude 3.5 Haiku (standard version)
+            "claude-3-5-haiku-latest",     # Claude 3.5 Haiku (latest alias)
             "claude-3-haiku-20240307"      # Claude 3 Haiku
         ]
         
