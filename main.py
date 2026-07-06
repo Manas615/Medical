@@ -2,7 +2,9 @@ import os
 import sys
 import json
 import logging
+import asyncio
 from dotenv import load_dotenv
+from typing import Dict, Any
 
 from fhir_client import FHIRClient
 from jsonrpc import JSONRPCDispatcher
@@ -24,7 +26,31 @@ fh.setLevel(logging.DEBUG)
 fh.setFormatter(file_formatter)
 logger.addHandler(fh)
 
-def run_query(dispatcher: JSONRPCDispatcher, patient_id: str, query: str):
+def print_human_readable_recommendation(result: Dict[str, Any]):
+    """Formats the SOAP note result in a clean, human-readable structure."""
+    if "soap" in result:
+        soap = result["soap"]
+        print("\n" + "=" * 80)
+        print("                 CLINICAL ANALYSIS REPORT (SOAP NOTE)")
+        print("=" * 80)
+        print(f"\n[SUBJECTIVE]\n{soap.get('subjective', 'N/A')}\n")
+        print(f"[OBJECTIVE]\n{soap.get('objective', 'N/A')}\n")
+        print(f"[ASSESSMENT]\n{soap.get('assessment', 'N/A')}\n")
+        print("[PLAN]")
+        plan = soap.get("plan", [])
+        if isinstance(plan, list):
+            for idx, item in enumerate(plan, 1):
+                print(f"  {idx}. {item}")
+        else:
+            print(f"  {plan}")
+        print("\n" + "-" * 80)
+        print(f"Confidence Score: {result.get('confidence_score', 'N/A')}")
+        print("=" * 80 + "\n")
+    else:
+        # Fallback to json dump if the structure is unexpected
+        print(json.dumps(result, indent=2))
+
+async def run_query(dispatcher: JSONRPCDispatcher, patient_id: str, query: str):
     """Sends query to JSON-RPC dispatcher and prints clean output."""
     rpc_request = {
         "jsonrpc": "2.0",
@@ -38,19 +64,19 @@ def run_query(dispatcher: JSONRPCDispatcher, patient_id: str, query: str):
 
     logger.debug(f"Sending JSON-RPC request: {json.dumps(rpc_request)}")
     print("Thinking...")
-    rpc_response = dispatcher.handle_request(rpc_request)
+    rpc_response = await dispatcher.handle_request(rpc_request)
     logger.debug(f"Received JSON-RPC response: {json.dumps(rpc_response)}")
     
     if rpc_response and "result" in rpc_response:
         result = rpc_response["result"]
-        print(json.dumps(result, indent=2))
+        print_human_readable_recommendation(result)
     elif rpc_response and "error" in rpc_response:
         print("[ERROR] Analysis failed:")
         print(json.dumps(rpc_response["error"], indent=2))
     else:
         print("[ERROR] Unresponsive pipeline.")
 
-def main():
+async def main():
     load_dotenv()
     api_key = os.environ.get("CLAUDE_CREDENTIALS") or os.environ.get("ANTHROPIC_API_KEY")
     
@@ -72,7 +98,7 @@ def main():
 
     print("Caching patient history...")
     try:
-        agent.active_bundle = fhir_client.fetch_patient_bundle(patient_id)
+        agent.active_bundle = await fhir_client.fetch_patient_bundle(patient_id)
         print("Cache initialized.")
     except Exception as e:
         print(f"[ERROR] Ingestion failed: {e}")
@@ -93,7 +119,7 @@ def main():
             query = "Analyze patient's chronic conditions, current control, and suggest a clinical recommendation."
 
         print(f"\nQuery: '{query}'")
-        run_query(dispatcher, patient_id, query)
+        await run_query(dispatcher, patient_id, query)
     else:
         # Interactive REPL mode
         print("\nEnter questions about the patient's medical history.")
@@ -101,15 +127,18 @@ def main():
         print("----------------------------------------------------------------------")
         try:
             while True:
-                query = input("\nAsk a question > ").strip()
+                # Run standard input query in an executor to avoid blocking the async event loop
+                query = await asyncio.to_thread(input, "\nAsk a question > ")
+                query = query.strip()
                 if not query:
                     continue
                 if query.lower() in ("exit", "quit"):
                     print("Goodbye!")
                     break
-                run_query(dispatcher, patient_id, query)
+                await run_query(dispatcher, patient_id, query)
         except KeyboardInterrupt:
             print("\nSession ended. Goodbye!")
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
+

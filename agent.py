@@ -1,7 +1,6 @@
 import json
 import logging
 import re
-import urllib.request
 from typing import Dict, List, Any, Optional
 from pydantic import BaseModel, Field
 import anthropic
@@ -39,34 +38,34 @@ class MedicalAgent:
 
         # Initialize official Anthropic SDK client
         if self.api_key:
-            self.client = anthropic.Anthropic(api_key=self.api_key)
+            self.client = anthropic.AsyncAnthropic(api_key=self.api_key)
         else:
             self.client = None
 
     # --- Tool Implementations (JSON-RPC endpoints) ---
 
-    def get_patient_info(self, patient_id: str) -> Dict[str, Any]:
+    async def get_patient_info(self, patient_id: str) -> Dict[str, Any]:
         """Tool: Fetches basic demographic info from active patient bundle."""
         logger.info(f"Tool Executed: get_patient_info(patient_id='{patient_id}')")
         if not self.active_bundle:
-            self.active_bundle = self.fhir_client.fetch_patient_bundle(patient_id)
+            self.active_bundle = await self.fhir_client.fetch_patient_bundle(patient_id)
         return self.fhir_client.extract_patient_info(self.active_bundle)
 
-    def get_conditions(self, patient_id: str) -> List[Dict[str, Any]]:
+    async def get_conditions(self, patient_id: str) -> List[Dict[str, Any]]:
         """Tool: Fetches active diagnoses from active patient bundle."""
         logger.info(f"Tool Executed: get_conditions(patient_id='{patient_id}')")
         if not self.active_bundle:
-            self.active_bundle = self.fhir_client.fetch_patient_bundle(patient_id)
+            self.active_bundle = await self.fhir_client.fetch_patient_bundle(patient_id)
         return self.fhir_client.extract_conditions(self.active_bundle)
 
-    def get_vitals(self, patient_id: str) -> List[Dict[str, Any]]:
+    async def get_vitals(self, patient_id: str) -> List[Dict[str, Any]]:
         """Tool: Fetches vitals and lab observations from active patient bundle."""
         logger.info(f"Tool Executed: get_vitals(patient_id='{patient_id}')")
         if not self.active_bundle:
-            self.active_bundle = self.fhir_client.fetch_patient_bundle(patient_id)
+            self.active_bundle = await self.fhir_client.fetch_patient_bundle(patient_id)
         return self.fhir_client.extract_vitals(self.active_bundle)
 
-    def analyze_history(self, patient_id: str, query: str) -> Dict[str, Any]:
+    async def analyze_history(self, patient_id: str, query: str) -> Dict[str, Any]:
         """
         Tool: Kicks off the ReAct reasoning and acting loop on the patient.
         Returns the final recommendation strictly adhering to the MedicalRecommendation schema.
@@ -74,16 +73,16 @@ class MedicalAgent:
         logger.info(f"Tool Executed: analyze_history(patient_id='{patient_id}', query='{query}')")
         
         # Ensure we fetch and store the bundle first
-        self.active_bundle = self.fhir_client.fetch_patient_bundle(patient_id)
+        self.active_bundle = await self.fhir_client.fetch_patient_bundle(patient_id)
         
         if self.api_key:
-            return self._run_live_react_loop(patient_id, query)
+            return await self._run_live_react_loop(patient_id, query)
         else:
-            return self._run_simulated_react_loop(patient_id, query)
+            return await self._run_simulated_react_loop(patient_id, query)
 
     # --- ReAct Execution Loops ---
 
-    def _run_live_react_loop(self, patient_id: str, query: str) -> Dict[str, Any]:
+    async def _run_live_react_loop(self, patient_id: str, query: str) -> Dict[str, Any]:
         """Executes a real ReAct loop calling the Anthropic API with model fallbacks."""
         logger.info("Executing ReAct loop via live Anthropic (Claude) API connection.")
         
@@ -137,7 +136,7 @@ class MedicalAgent:
             
             try:
                 # Call Anthropic model
-                raw_response = self._call_anthropic_api(system_prompt, messages)
+                raw_response = await self._call_anthropic_api(system_prompt, messages)
                 logger.info(f"Agent Thought-Process (Live Claude):\n{raw_response}")
                 
                 # Append thought-process to agent_activity.log
@@ -180,7 +179,7 @@ class MedicalAgent:
                     try:
                         rpc_request = json.loads(action_str)
                         # Execute the tool via JSON-RPC dispatcher
-                        rpc_response = self.dispatcher.handle_request(rpc_request)
+                        rpc_response = await self.dispatcher.handle_request(rpc_request)
                         
                         # Add observation turn to history
                         messages.append({
@@ -206,9 +205,9 @@ class MedicalAgent:
 
         # Fallback to simulation if live loop fails to finish
         logger.warning("Live ReAct loop exceeded maximum steps or failed. Falling back to simulation.")
-        return self._run_simulated_react_loop(patient_id, query)
+        return await self._run_simulated_react_loop(patient_id, query)
 
-    def _run_simulated_react_loop(self, patient_id: str, query: str) -> Dict[str, Any]:
+    async def _run_simulated_react_loop(self, patient_id: str, query: str) -> Dict[str, Any]:
         """Simulates the ReAct loop deterministically, performing actual JSON-RPC tool calls."""
         logger.info(f"Executing ReAct loop via local offline reasoning simulator for query: '{query}'")
         
@@ -221,7 +220,7 @@ class MedicalAgent:
             "id": 1
         }
         self._log_simulated_step(1, thought_1, action_1)
-        obs_1 = self.dispatcher.handle_request(action_1)
+        obs_1 = await self.dispatcher.handle_request(action_1)
         
         patient_data = obs_1.get("result", {})
         patient_name = patient_data.get("name", "Joe Smart")
@@ -237,8 +236,7 @@ class MedicalAgent:
             "id": 2
         }
         self._log_simulated_step(2, thought_2, action_2)
-        obs_2 = self.dispatcher.handle_request(action_2)
-        conditions_list = [c.get("display") for c in obs_2.get("result", [])]
+        obs_2 = await self.dispatcher.handle_request(action_2)
 
         # Step 3: Get Vitals/Labs
         thought_3 = "I need to fetch the latest observations (vitals and lab values) to evaluate the control parameters of diagnosed conditions."
@@ -249,7 +247,7 @@ class MedicalAgent:
             "id": 3
         }
         self._log_simulated_step(3, thought_3, action_3)
-        obs_3 = self.dispatcher.handle_request(action_3)
+        obs_3 = await self.dispatcher.handle_request(action_3)
 
         # Step 4: Routing and Clinical Reasoning based on query keywords
         q_lower = query.lower()
@@ -386,28 +384,27 @@ class MedicalAgent:
 
     # --- Helper Utilities ---
 
-    def _call_anthropic_api(self, system_prompt: str, messages: List[Dict[str, Any]]) -> str:
+    async def _call_anthropic_api(self, system_prompt: str, messages: List[Dict[str, Any]]) -> str:
         """Invokes the Anthropic Messages API using the official Anthropic SDK client with fallbacks."""
         if not self.client:
             raise RuntimeError("Anthropic client is not initialized.")
         
         # A list of models to try in order of capability/preference.
-        # This provides fallback options in case specific models are not supported on the user's account.
         models_to_try = [
-            "claude-haiku-4-5",            # Custom model name requested by the user
-            "claude-3-5-sonnet-latest",    # Claude 3.5 Sonnet (latest alias)
-            "claude-3-5-sonnet-20241022",  # Claude 3.5 Sonnet v2
-            "claude-3-5-sonnet-20240620",  # Claude 3.5 Sonnet v1
-            "claude-3-5-haiku-20241022",   # Claude 3.5 Haiku (standard version)
-            "claude-3-5-haiku-latest",     # Claude 3.5 Haiku (latest alias)
-            "claude-3-haiku-20240307"      # Claude 3 Haiku
+            "claude-haiku-4-5",
+            "claude-3-5-sonnet-latest",
+            "claude-3-5-sonnet-20241022",
+            "claude-3-5-sonnet-20240620",
+            "claude-3-5-haiku-20241022",
+            "claude-3-5-haiku-latest",
+            "claude-3-haiku-20240307"
         ]
         
         last_error = None
         for model in models_to_try:
             try:
                 logger.info(f"Attempting Claude API call with model: {model}...")
-                response = self.client.messages.create(
+                response = await self.client.messages.create(
                     model=model,
                     max_tokens=2048,
                     system=system_prompt,
@@ -416,11 +413,9 @@ class MedicalAgent:
                 logger.info(f"Successfully executed Claude API call with model: {model}")
                 return response.content[0].text
             except Exception as e:
-                # Catch and log 404 (model not found) or other availability errors
                 last_error = e
                 logger.warning(f"Failed Claude call for model '{model}': {e}. Trying next fallback...")
         
-        # If all models fail, raise the last exception
         logger.error(f"All Anthropic models failed. Last error: {last_error}")
         raise RuntimeError(f"Anthropic API invocation failed for all models: {last_error}") from last_error
 
@@ -435,5 +430,4 @@ class MedicalAgent:
 
     def _log_agent_thought(self, content: str):
         """Helper to append agent thought processes to the log file explicitly."""
-        # Logs the thought process at INFO level so it is printed and written to file.
         logger.info(f"[Agent Thought-Process]\n{content}\n")

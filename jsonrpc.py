@@ -33,7 +33,7 @@ class JSONRPCDispatcher:
         self.methods[name] = func
         logger.debug(f"Registered JSON-RPC method: {name}")
 
-    def handle_request_string(self, request_str: str) -> str:
+    async def handle_request_string(self, request_str: str) -> str:
         """Parses a JSON string request, processes it, and returns the response as a JSON string."""
         logger.debug(f"Received raw JSON-RPC string: {request_str}")
         try:
@@ -42,7 +42,7 @@ class JSONRPCDispatcher:
             response = self._make_error_response(PARSE_ERROR, "Parse error: Invalid JSON.", None, None)
             return json.dumps(response)
 
-        response_data = self.handle_request(request_data)
+        response_data = await self.handle_request(request_data)
         
         # If it is a list of requests (batch request)
         if isinstance(response_data, list):
@@ -56,7 +56,7 @@ class JSONRPCDispatcher:
             return ""
         return json.dumps(response_data)
 
-    def handle_request(self, request: Any) -> Optional[Any]:
+    async def handle_request(self, request: Any) -> Optional[Any]:
         """Processes a parsed JSON-RPC request (dict) or list of requests (batch)."""
         if isinstance(request, list):
             # Batch request
@@ -64,15 +64,16 @@ class JSONRPCDispatcher:
                 return self._make_error_response(INVALID_REQUEST, "Invalid Request: Empty batch.", None, None)
             responses = []
             for req in request:
-                res = self._process_single_request(req)
+                res = await self._process_single_request(req)
                 if res is not None:
                     responses.append(res)
             return responses
         
-        return self._process_single_request(request)
+        return await self._process_single_request(request)
 
-    def _process_single_request(self, req: Any) -> Optional[Dict[str, Any]]:
+    async def _process_single_request(self, req: Any) -> Optional[Dict[str, Any]]:
         """Processes a single JSON-RPC request dictionary."""
+        import inspect
         # 1. Log the incoming tool call
         logger.info(f"JSON-RPC Request: {json.dumps(req)}")
         
@@ -105,12 +106,17 @@ class JSONRPCDispatcher:
 
             func = self.methods[method_name]
 
-            # Execute method
+            # Execute method (supports sync and async functions)
             try:
                 if isinstance(params, dict):
-                    result = func(**params)
+                    res_or_coro = func(**params)
                 else:  # list
-                    result = func(*params)
+                    res_or_coro = func(*params)
+                
+                if inspect.iscoroutine(res_or_coro):
+                    result = await res_or_coro
+                else:
+                    result = res_or_coro
             except TypeError as te:
                 # Catch incorrect argument counts
                 raise JSONRPCError(INVALID_PARAMS, f"Invalid params: {te}")

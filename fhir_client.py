@@ -1,8 +1,7 @@
 import os
 import json
 import logging
-import urllib.request
-import ssl
+import httpx
 from typing import Dict, List, Any, Optional
 
 logger = logging.getLogger("medical_agent")
@@ -11,76 +10,98 @@ class FHIRClient:
     def __init__(self, base_url: str = "https://r4.smarthealthit.org"):
         self.base_url = base_url.rstrip('/')
 
-    def fetch_patient_bundle(self, patient_id: str) -> Dict[str, Any]:
+    async def fetch_patient_bundle(self, patient_id: str) -> Dict[str, Any]:
         """
         Fetches patient record from SMART on FHIR.
-        First dynamically searches for an active patient ID if patient_id is the default
+        First dynamically searches for an active patient ID if patient_id is default/empty
         or if we encounter fetch errors, then pulls their history ($everything or direct).
+        Supports reading from a local directory if base_url is a directory path.
         """
+        # Check if base_url is a local directory
+        if os.path.isdir(self.base_url):
+            logger.info(f"base_url '{self.base_url}' is a directory. Reading patient data from directory.")
+            # 1. Search for a file named {patient_id}.json
+            file_path = os.path.join(self.base_url, f"{patient_id}.json")
+            if os.path.isfile(file_path):
+                try:
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        bundle_data = json.load(f)
+                    logger.info(f"Successfully loaded patient bundle from file: {file_path}")
+                    return bundle_data
+                except Exception as e:
+                    logger.error(f"Failed to read patient file {file_path}: {e}")
+            
+            # 2. Iterate through all .json files in the directory and search inside them
+            try:
+                for filename in os.listdir(self.base_url):
+                    if filename.endswith(".json"):
+                        candidate_path = os.path.join(self.base_url, filename)
+                        with open(candidate_path, "r", encoding="utf-8") as f:
+                            candidate_data = json.load(f)
+                            if candidate_data.get("resourceType") == "Patient" and candidate_data.get("id") == patient_id:
+                                logger.info(f"Found matching Patient resource in file: {candidate_path}")
+                                return candidate_data
+                            elif candidate_data.get("resourceType") == "Bundle":
+                                for entry in candidate_data.get("entry", []):
+                                    res = entry.get("resource", {})
+                                    if res.get("resourceType") == "Patient" and res.get("id") == patient_id:
+                                        logger.info(f"Found matching Patient inside bundle file: {candidate_path}")
+                                        return candidate_data
+            except Exception as e:
+                logger.error(f"Error scanning directory {self.base_url}: {e}")
+            
+            logger.warning(f"Could not find patient {patient_id} in directory {self.base_url}. Using mock fallback.")
+            return self._load_mock_bundle()
+
         resolved_patient_id = patient_id
-        ssl_ctx = ssl.create_default_context()
-        ssl_ctx.check_hostname = False
-        ssl_ctx.verify_mode = ssl.CERT_NONE
-
-        # 1. Dynamically search for an active patient on the sandbox
-        search_url = f"{self.base_url}/Patient?_count=1"
-        logger.info(f"Searching for an active patient dynamically at: {search_url}")
-        req_search = urllib.request.Request(
-            search_url,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AntigravityFHIRClient/1.0"}
-        )
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AntigravityFHIRClient/1.0"}
         
-        try:
-            with urllib.request.urlopen(req_search, context=ssl_ctx, timeout=10) as response:
-                search_data = json.loads(response.read().decode("utf-8"))
-                entries = search_data.get("entry", [])
-                if entries:
-                    # Resolve to the active patient ID found on the sandbox
-                    resolved_patient_id = entries[0].get("resource", {}).get("id", patient_id)
-                    logger.info(f"Discovered active patient ID on sandbox: {resolved_patient_id}")
-                else:
-                    logger.warning("Dynamic search returned no patients. Using default patient ID.")
-        except Exception as e:
-            logger.warning(f"Dynamic patient search failed: {e}. Falling back to default ID: {patient_id}")
+        async with httpx.AsyncClient(verify=False, timeout=15.0) as client:
+            # 1. Dynamically search for an active patient ONLY IF patient_id is not specified or is "default"
+            # This ensures we stick to a single patient when one is provided.
+            if not resolved_patient_id or resolved_patient_id in ("default", "smart-default"):
+                search_url = f"{self.base_url}/Patient?_count=1"
+                logger.info(f"Searching for an active patient dynamically at: {search_url}")
+                try:
+                    response = await client.get(search_url, headers=headers)
+                    response.raise_for_status()
+                    search_data = response.json()
+                    entries = search_data.get("entry", [])
+                    if entries:
+                        resolved_patient_id = entries[0].get("resource", {}).get("id", patient_id)
+                        logger.info(f"Discovered active patient ID on sandbox: {resolved_patient_id}")
+                    else:
+                        logger.warning("Dynamic search returned no patients. Using default patient ID.")
+                except Exception as e:
+                    logger.warning(f"Dynamic patient search failed: {e}. Falling back to default ID: {patient_id}")
 
-        # 2. Attempt to pull the complete clinical history using $everything
-        url_everything = f"{self.base_url}/Patient/{resolved_patient_id}/$everything"
-        logger.info(f"Ingesting patient clinical history from: {url_everything}")
-        req_everything = urllib.request.Request(
-            url_everything,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AntigravityFHIRClient/1.0"}
-        )
+            # 2. Attempt to pull the complete clinical history using $everything
+            url_everything = f"{self.base_url}/Patient/{resolved_patient_id}/$everything"
+            logger.info(f"Ingesting patient clinical history from: {url_everything}")
 
-        raw_payload = ""
-        bundle_data = {}
-        fetch_success = False
+            bundle_data = {}
+            fetch_success = False
 
-        try:
-            with urllib.request.urlopen(req_everything, context=ssl_ctx, timeout=15) as response:
-                raw_payload = response.read().decode("utf-8")
-                logger.debug(f"Raw API Response ($everything): {raw_payload}")
-                bundle_data = json.loads(raw_payload)
+            try:
+                response = await client.get(url_everything, headers=headers)
+                response.raise_for_status()
+                bundle_data = response.json()
                 fetch_success = True
                 logger.info(f"Successfully retrieved FHIR bundle ($everything) for patient {resolved_patient_id}.")
-        except Exception as e:
-            logger.warning(f"Failed to fetch $everything history: {e}. Attempting direct Patient resource fetch.")
-            # 3. Fallback: fetch patient resource directly
-            url_patient = f"{self.base_url}/Patient/{resolved_patient_id}"
-            logger.info(f"Ingesting direct patient data from: {url_patient}")
-            req_patient = urllib.request.Request(
-                url_patient,
-                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AntigravityFHIRClient/1.0"}
-            )
-            try:
-                with urllib.request.urlopen(req_patient, context=ssl_ctx, timeout=15) as response:
-                    raw_payload = response.read().decode("utf-8")
-                    logger.debug(f"Raw API Response (Direct Patient): {raw_payload}")
-                    bundle_data = json.loads(raw_payload)
+            except Exception as e:
+                logger.warning(f"Failed to fetch $everything history: {e}. Attempting direct Patient resource fetch.")
+                # 3. Fallback: fetch patient resource directly
+                url_patient = f"{self.base_url}/Patient/{resolved_patient_id}"
+                logger.info(f"Ingesting direct patient data from: {url_patient}")
+                try:
+                    response = await client.get(url_patient, headers=headers)
+                    response.raise_for_status()
+                    bundle_data = response.json()
                     fetch_success = True
                     logger.info(f"Successfully retrieved FHIR patient resource for patient {resolved_patient_id}.")
-            except Exception as e2:
-                logger.error(f"Failed to fetch direct patient record: {e2}")
-                logger.info("Proceeding to load local fallback data due to fetch errors.")
+                except Exception as e2:
+                    logger.error(f"Failed to fetch direct patient record: {e2}")
+                    logger.info("Proceeding to load local fallback data due to fetch errors.")
 
         # Check if the bundle contains clinical data (Observations or Conditions)
         has_clinical_data = False
@@ -94,7 +115,6 @@ class FHIRClient:
                         has_clinical_data = True
                         break
             else:
-                # If we fetched a single Patient resource, we need the clinical fallback data
                 has_clinical_data = False
 
         if not has_clinical_data:
@@ -263,3 +283,4 @@ class FHIRClient:
                         "unit": unit
                     })
         return vitals
+        
