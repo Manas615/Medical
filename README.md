@@ -1,95 +1,94 @@
-# SMART on FHIR Medical History Analyzer Agent (Anthropic Edition)
+# SMART on FHIR — Medical History Analyzer
 
-This is a Python-based Agentic AI project designed to analyze a single patient's medical history using standard FHIR resources. 
+A compact Python async agent that analyzes a single patient's medical history using FHIR resources and a JSON-RPC 2.0 toolset. The project provides both a live Anthropic (Claude) mode and a deterministic offline simulation mode for reproducible clinical reasoning.
 
-The agent utilizes a standard **JSON-RPC 2.0** interface to interact with external tools and executes a clinical **ReAct (Reasoning + Acting) loop** to process data, format reasoning thoughts, and compile a structured, Pydantic-validated medical recommendation.
+## Key Components
+
+- `main.py`: CLI entrypoint and orchestration (async). Initializes logging and runs the agent REPL or single-run query.
+- `fhir_client.py`: Async FHIR ingestion using `httpx.AsyncClient` with a local `mock_patient_bundle.json` fallback when live data is unavailable.
+- `jsonrpc.py`: Minimal JSON-RPC 2.0 dispatcher and error handling for registering and invoking tool methods.
+- `agent.py`: Implements the `MedicalAgent` with Pydantic schemas, a simulated ReAct loop, and an optional live ReAct loop that calls Anthropic via the official SDK.
 
 ## Architecture
 
 ```mermaid
 flowchart TD
-    A[CLI User / main.py] -->|1. Request analyze_history| B[JSON-RPC Dispatcher]
-    B -->|2. Run ReAct Loop| C[Medical Agent]
-    
-    C -->|3. Call Tool via JSON-RPC| B
-    B -->|4. Route get_patient_info / get_vitals / get_conditions| D[FHIR Client]
-    
-    D -->|5. Fetch via urllib.request| E[SMART on FHIR API Endpoint]
-    D -.->|6. Mock Fallback if Empty| F[mock_patient_bundle.json]
-    
-    D -->|7. Return Raw JSON| B
-    B -->|8. Return JSON-RPC Response| C
-    
-    C -->|9. Formulate Recommendation| G[Pydantic Validation]
-    G -->|10. Return Structured Recommendation| A
-    
-    C -.->|Log thought processes, raw API responses, RPC payloads| H[agent_activity.log]
+      A[CLI User / main.py] -->|1. Request analyze_history| B[JSON-RPC Dispatcher]
+      B -->|2. Run ReAct Loop| C[Medical Agent]
+      C -->|3. Call Tool via JSON-RPC| B
+      B -->|4. Route get_patient_info / get_vitals / get_conditions| D[FHIR Client]
+      D -->|5. Fetch via httpx AsyncClient| E[SMART on FHIR API Endpoint]
+      D -.->|6. Mock Fallback if Empty| F[mock_patient_bundle.json]
+      C -->|7. Formulate Pydantic-validated Recommendation| G[Pydantic Validation]
+      G -->|8. Return Structured Recommendation| A
+      C -.->|Log thought processes, raw API responses, RPC payloads| H[agent_activity.log]
 ```
 
 ## Features
 
-- **Urllib Data Ingestion**: Direct fetching of patient bundles from the SMART on FHIR `$everything` endpoint.
-- **Mock Data Fallback**: Integrates high-fidelity clinical fallback resources (`mock_patient_bundle.json`) containing observations (blood pressure, HbA1c, LDL) and conditions (diabetes, hypertension) since sandbox endpoints can occasionally be empty.
-- **Strict JSON-RPC 2.0 interface**: Dispatcher checks frames, parameters, methods, and implements standard JSON-RPC 2.0 error specifications.
-- **Dual ReAct Reasoning Engine**: 
-  - **Live AI Mode**: Directly accesses the Anthropic Claude API (`claude-3-5-sonnet-20241022`) using raw `urllib.request` (no heavy SDK requirements) when configured with a `CLAUDE_CREDENTIALS` or `ANTHROPIC_API_KEY` key.
-  - **Offline Simulation Mode**: Walks through a high-fidelity clinical reasoning simulation, executing the actual JSON-RPC tool calls, parsing outputs, and generating recommendations.
-- **Auditable Log System**: Configures `logging` to capture and record user queries, JSON-RPC payloads, raw API payloads, and intermediate reasoning steps to `agent_activity.log` at the `DEBUG` level.
+- Async FHIR ingestion with `httpx` and local-file fallback for reproducible demos.
+- JSON-RPC 2.0 dispatcher for tool registration (`get_patient_info`, `get_conditions`, `get_vitals`, `analyze_history`).
+- ReAct-style reasoning loop:
+   - Live mode: Calls Anthropic via the official SDK (`anthropic.AsyncAnthropic`) when `CLAUDE_CREDENTIALS` or `ANTHROPIC_API_KEY` is set.
+   - Simulation mode: Deterministic local reasoning that performs the same JSON-RPC tool calls and returns a Pydantic-validated SOAP recommendation.
+- Pydantic models to enforce the SOAP structure of final recommendations.
+- Detailed auditing to `agent_activity.log` (DEBUG) capturing raw FHIR payloads, JSON-RPC frames, and agent thought logs.
 
----
+## Setup
 
-## Setup & Installation
+1. Install Python 3.8+.
+2. Install dependencies:
 
-1. **Prerequisites**: Ensure Python 3.8+ is installed on your system.
-2. **Install Dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. **Configure Environment** (Optional for Live AI Mode):
-   - Duplicate `.env.example` to `.env`
-   - Set your Anthropic API Key:
-     ```env
-     CLAUDE_CREDENTIALS=your-anthropic-key-here
-     ```
-   - If left empty, the application will run in offline simulation mode, which demonstrates the full ReAct pipeline, JSON-RPC communication, and tools.
+```bash
+pip install -r requirements.txt
+```
 
----
+3. (Optional) Enable Live Anthropic mode by setting an environment variable in your shell or a `.env` file:
 
-## How to Run
+```bash
+export CLAUDE_CREDENTIALS=your-anthropic-key-here
+# or on Windows PowerShell
+$env:CLAUDE_CREDENTIALS = 'your-anthropic-key-here'
+```
 
-### Main CLI Application
-To run the analysis for the patient:
+If no API key is present, the agent runs in offline simulation mode.
+
+## Run
+
+- Single CLI run (default patient):
+
 ```bash
 python main.py
 ```
-To run for a custom patient ID or query:
+
+- Run for a specific patient ID or one-off query:
+
 ```bash
 python main.py smart-1288992 "Analyze blood pressure values and suggest adjustments"
 ```
 
-### Verification Test Suite
-To execute the automated validation suite (which runs unit tests for data ingestion, JSON-RPC handlers, and offline ReAct loops):
+- Interactive REPL mode: just run `python main.py` and enter questions at the prompt.
+
+## Tests / Verification
+
+Run the small verification script (uses pytest / asyncio hooks):
+
 ```bash
 python verify_project.py
 ```
 
+## Logs
+
+- Activity and debug logging are written to `agent_activity.log` in the project root. Look for:
+   - `Raw FHIR Response` or `Mock FHIR Data Loaded` entries for data ingestion.
+   - `JSON-RPC Request` / `JSON-RPC Response` frames for tool interactions.
+   - `[Agent Thought-Process]` entries for simulated or live ReAct transcripts.
+
+## Notes
+
+- The project intentionally uses an async stack (`asyncio` + `httpx` + Anthropic async client) for non-blocking I/O.
+- The mock bundle (`mock_patient_bundle.json`) provides reproducible demo data when the sandbox FHIR server returns limited records.
+
 ---
 
-## Audit Logs (`agent_activity.log`)
-
-The log file is created in the root directory. To audit the agent's chain of thought and check the evidence for its clinical decisions, check the following sections in `agent_activity.log`:
-
-1. **Raw FHIR Response Payload**: Logs the exact raw JSON downloaded from the SMART on FHIR endpoint (labeled under `Raw API Response` or `Mock FHIR Data Loaded`).
-2. **JSON-RPC Calls**: Look for `JSON-RPC Request` and `JSON-RPC Response` entries to review the exact frame communications.
-3. **Agent Thoughts**: Search for `[Agent Thought-Process]` to inspect intermediate steps, such as:
-   ```text
-   Thought: The patient has active diagnoses including Type 2 Diabetes... I must fetch the latest clinical observations (vitals and lab values)...
-   Action (JSON-RPC): { "jsonrpc": "2.0", "method": "get_vitals", ... }
-   ```
-<<<<<<< HEAD
-=======
-# Medical
-Python-based Agentic AI project designed to analyse a single patient's medical history
-=======
-
->>>>>>> c63fcdb (change to httpx instead of urllib and implementing async and await)
+If you'd like, I can also run the verification script now or adjust any section wording. Changes are saved to [README.md](README.md).

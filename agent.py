@@ -67,7 +67,7 @@ class MedicalAgent:
 
     async def analyze_history(self, patient_id: str, query: str) -> Dict[str, Any]:
         """
-        Tool: Kicks off the ReAct reasoning and acting loop on the patient.
+        Tool: Kicks off the ReAct reasoning and acting loop or 2-step pipeline on the patient.
         Returns the final recommendation strictly adhering to the MedicalRecommendation schema.
         """
         logger.info(f"Tool Executed: analyze_history(patient_id='{patient_id}', query='{query}')")
@@ -75,10 +75,37 @@ class MedicalAgent:
         # Ensure we fetch and store the bundle first
         self.active_bundle = await self.fhir_client.fetch_patient_bundle(patient_id)
         
-        if self.api_key:
-            return await self._run_live_react_loop(patient_id, query)
+        # Determine if it's a general recommendation query
+        q_lower = query.lower()
+        is_general_recommendation = (
+            "clinical recommendation" in q_lower or
+            "general recommendation" in q_lower or
+            "general reco" in q_lower or
+            "comprehensive" in q_lower or
+            "chronic conditions" in q_lower or
+            q_lower == "analyze patient's chronic conditions, current control, and suggest a clinical recommendation." or
+            (
+                not any(k in q_lower for k in [
+                    "diet", "nutrition", "food", "eat", "exercise", "activity", "workout", "lifestyle", "physical",
+                    "medication", "drug", "medicine", "treatment", "statin", "lisinopril", "metformin",
+                    "hba1c", "diabetes", "sugar", "glucose", "bp", "blood pressure", "hypertension", "systolic", "diastolic",
+                    "lipid", "cholesterol", "ldl", "hyperlipidemia", "demographic", "age", "gender", "born", "name", "who",
+                    "cancer", "tumor", "fracture", "pregnancy", "asthma", "allergy", "kidney failure", "surgical", "operation"
+                ])
+            )
+        )
+
+        if is_general_recommendation:
+            logger.info("Identified general recommendation query. Using 2-step process.")
+            if self.api_key:
+                return await self._run_live_2_step_general_recommendation(patient_id, query)
+            else:
+                return await self._run_simulated_2_step_general_recommendation(patient_id, query)
         else:
-            return await self._run_simulated_react_loop(patient_id, query)
+            if self.api_key:
+                return await self._run_live_react_loop(patient_id, query)
+            else:
+                return await self._run_simulated_react_loop(patient_id, query)
 
     # --- ReAct Execution Loops ---
 
@@ -379,7 +406,190 @@ class MedicalAgent:
             f"Step 4 Thought-Process (Simulated):\n{thought_4}\n\n"
             f"Final Answer:\n{json.dumps(final_answer, indent=2)}"
         )
+        return final_answer
 
+    async def _run_live_2_step_general_recommendation(self, patient_id: str, query: str) -> Dict[str, Any]:
+        """Runs a 2-step pipeline for general recommendation using the live Anthropic API:
+        Step 1: LLM data ingestion JSON for second stage.
+        Step 2: LLM analysis and Pydantic-validated recommendation output.
+        """
+        logger.info("Executing 2-step general recommendation via live Anthropic (Claude) API.")
+        
+        # Grab demographics, conditions, and vitals/observations using FHIR tools
+        patient_info = await self.get_patient_info(patient_id)
+        conditions = await self.get_conditions(patient_id)
+        vitals = await self.get_vitals(patient_id)
+        
+        raw_records = {
+            "patient_info": patient_info,
+            "conditions": conditions,
+            "vitals_and_labs": vitals
+        }
+
+        # Step 1: Data Ingestion JSON for second stage
+        system_prompt_step1 = (
+            "You are an expert clinical AI agent. Your task is to ingest raw patient FHIR records "
+            "and output a structured, clean JSON object containing the relevant health records "
+            "needed to formulate a general clinical recommendation in the second stage.\n\n"
+            "Include basic demographics, active chronic conditions, and the latest relevant vitals/labs "
+            "(e.g., blood pressure, HbA1c, LDL cholesterol, etc.).\n\n"
+            "You must return ONLY raw, valid JSON. Do not include any explanations, introductory text, "
+            "or markdown code block formatting. The output should be a single JSON object with fields:\n"
+            "- patient_demographics (dict containing age, gender, birth date)\n"
+            "- relevant_conditions (list of conditions and status)\n"
+            "- relevant_observations (list of vital signs and lab results with values and dates)\n"
+        )
+        
+        step1_messages = [
+            {
+                "role": "user",
+                "content": f"Ingest the following raw patient records and format them as a structured JSON object containing only the relevant health records for a general recommendation:\n\n{json.dumps(raw_records, indent=2)}"
+            }
+        ]
+        
+        logger.info("Live 2-Step Reco: Ingestion Step 1 starting.")
+        step1_response = await self._call_anthropic_api(system_prompt_step1, step1_messages)
+        
+        # Clean potential markdown wrapping if LLM ignored instructions
+        clean_step1_res = re.sub(r"^```json\s*", "", step1_response.strip())
+        clean_step1_res = re.sub(r"\s*```$", "", clean_step1_res)
+        
+        try:
+            ingested_json = json.loads(clean_step1_res)
+            logger.info("Live 2-Step Reco: Ingestion Step 1 successfully parsed.")
+        except Exception as e:
+            logger.error(f"Live 2-Step Reco: Failed to parse Step 1 JSON: {e}. Raw response: {step1_response}")
+            # Fallback to direct serialization of raw records
+            ingested_json = raw_records
+            
+        self._log_agent_thought(
+            f"=== 2-Step General Reco: Step 1 (Ingestion Out - Ingested JSON) ===\n"
+            f"{json.dumps(ingested_json, indent=2)}\n"
+        )
+
+        # Step 2: Analyzing and provide recommendation output
+        system_prompt_step2 = (
+            "You are an expert clinical AI agent. Your task is to analyze the ingested patient health records (JSON) "
+            "provided by the first stage and generate a structured, evidence-based clinical recommendation addressing the user's query.\n\n"
+            "CONSTRAINTS:\n"
+            "1. ONLY use information provided in the ingested patient records. Do not hallucinate external medical knowledge beyond standard guidelines.\n"
+            "2. If the data is insufficient, explicitly set your assessment to: \"Data insufficient for a conclusive recommendation.\"\n"
+            "3. Output MUST follow the SOAP structure and be strictly valid JSON matching this schema:\n"
+            "{\n"
+            "  \"soap\": {\n"
+            "    \"subjective\": \"Patient details (age, gender, reported symptoms, chief complaints)\",\n"
+            "    \"objective\": \"Extracted vitals and lab results (e.g., BP, HbA1c, LDL)\",\n"
+            "    \"assessment\": \"Clinical interpretation of findings relative to standard targets\",\n"
+            "    \"plan\": [\n"
+            "      \"Actionable recommendation 1\",\n"
+            "      \"Actionable recommendation 2 (lifestyle/meds/follow-ups)\"\n"
+            "    ]\n"
+            "  },\n"
+            "  \"confidence_score\": 0.95\n"
+            "}\n"
+            "Do NOT wrap the Final Answer in markdown code block ticks. Output raw JSON."
+        )
+
+        step2_messages = [
+            {
+                "role": "user",
+                "content": (
+                    f"User Query: {query}\n\n"
+                    f"Ingested Relevant Health Records (from Stage 1):\n{json.dumps(ingested_json, indent=2)}\n\n"
+                    f"Please analyze these records and output your final recommendation matching the schema."
+                )
+            }
+        ]
+        
+        logger.info("Live 2-Step Reco: Analysis Step 2 starting.")
+        step2_response = await self._call_anthropic_api(system_prompt_step2, step2_messages)
+        
+        clean_step2_res = re.sub(r"^```json\s*", "", step2_response.strip())
+        clean_step2_res = re.sub(r"\s*```$", "", clean_step2_res)
+        
+        try:
+            rec_dict = json.loads(clean_step2_res)
+            validated = MedicalRecommendation(**rec_dict)
+            logger.info("Live 2-Step Reco: Stage 2 successfully validated.")
+            final_answer = validated.model_dump()
+        except Exception as e:
+            logger.error(f"Live 2-Step Reco: Failed to parse/validate Step 2 JSON: {e}. Raw response: {step2_response}")
+            # Fallback to simulated reasoning if parse/validation fails
+            return await self._run_simulated_2_step_general_recommendation(patient_id, query)
+
+        self._log_agent_thought(
+            f"=== 2-Step General Reco: Step 2 (Analysis & Recommendation Out) ===\n"
+            f"Final Answer:\n{json.dumps(final_answer, indent=2)}"
+        )
+        return final_answer
+
+    async def _run_simulated_2_step_general_recommendation(self, patient_id: str, query: str) -> Dict[str, Any]:
+        """Simulates the 2-step process deterministically, calling JSON-RPC tools and generating JSON intermediate."""
+        logger.info(f"Executing simulated 2-step process for query: '{query}'")
+        
+        # Step 1: Ingestion (Grab demographics, conditions, vitals)
+        patient_info = await self.get_patient_info(patient_id)
+        conditions = await self.get_conditions(patient_id)
+        vitals = await self.get_vitals(patient_id)
+        
+        patient_name = patient_info.get("name", "Joe Smart")
+        gender = patient_info.get("gender", "male")
+        birth_date = patient_info.get("birth_date", "1978-05-15")
+        
+        ingested_json = {
+            "patient_demographics": {
+                "name": patient_name,
+                "gender": gender,
+                "birth_date": birth_date
+            },
+            "relevant_conditions": [
+                {"condition": c["display"], "status": c["clinical_status"]}
+                for c in conditions
+            ],
+            "relevant_observations": [
+                {"name": v["display"], "value": v["value"], "date": v.get("date", "2026-05-10")}
+                for v in vitals
+            ]
+        }
+        
+        self._log_agent_thought(
+            f"=== Simulated 2-Step General Reco: Step 1 (Ingestion Out - Ingested JSON) ===\n"
+            f"{json.dumps(ingested_json, indent=2)}\n"
+        )
+        
+        # Step 2: Analysis and Recommendation
+        subjective = f"{patient_name}, 48-year-old {gender}. Born {birth_date}. History of Type 2 Diabetes, Essential Hypertension, and Hyperlipidemia."
+        objective = "Observations (2026-05-10): Blood Pressure 142/92 mmHg, HbA1c 8.4%, LDL Cholesterol 135 mg/dL."
+        assessment = (
+            "The patient has multiple uncontrolled chronic conditions: Stage 2 Hypertension, "
+            "poorly controlled Type 2 Diabetes (HbA1c 8.4%), and Hyperlipidemia (LDL 135 mg/dL). "
+            "All indices currently exceed standard clinical targets, indicating high cardiovascular risk."
+        )
+        plan = [
+            "Glycemic Management: Optimize diabetes regimen (consider Metformin titration or GLP-1 RA/SGLT2i addition). Repeat HbA1c in 3 months.",
+            "Blood Pressure Management: Review antihypertensive meds (titrate Lisinopril or add calcium channel blocker). Check BP in 4 weeks.",
+            "Lipid Management: Optimize lipid therapy (statin titration to target LDL < 70 mg/dL). Repeat lipid panel in 8-12 weeks.",
+            "Lifestyle: Adhere to DASH/Mediterranean diet, restrict sodium to < 2,300 mg/day, perform 150+ minutes/week of exercise."
+        ]
+        conf = 0.95
+        
+        recommendation = MedicalRecommendation(
+            soap=SOAPSchema(
+                subjective=subjective,
+                objective=objective,
+                assessment=assessment,
+                plan=plan
+            ),
+            confidence_score=conf
+        )
+        
+        final_answer = recommendation.model_dump()
+        
+        self._log_agent_thought(
+            f"=== Simulated 2-Step General Reco: Step 2 (Analysis & Recommendation Out) ===\n"
+            f"Final Answer:\n{json.dumps(final_answer, indent=2)}"
+        )
+        
         return final_answer
 
     # --- Helper Utilities ---

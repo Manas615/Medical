@@ -116,6 +116,35 @@ async def test_react_agent_offline_flow():
     assert len(validated.soap.plan) > 0
     assert 0.0 <= validated.confidence_score <= 1.0
 
+@pytest.mark.asyncio
+async def test_react_agent_2step_general_recommendation_flow():
+    """Test the MedicalAgent in offline simulation mode for a general recommendation query runs the 2-step process."""
+    client = FHIRClient()
+    dispatcher = JSONRPCDispatcher()
+    agent = MedicalAgent(client, dispatcher, api_key=None)
+
+    # General recommendation query
+    query_str = "Analyze patient's chronic conditions, current control, and suggest a clinical recommendation."
+    req = {
+        "jsonrpc": "2.0",
+        "method": "analyze_history",
+        "params": {"patient_id": "smart-1288992", "query": query_str},
+        "id": "react_2step_test"
+    }
+    res = await dispatcher.handle_request(req)
+    
+    assert "result" in res
+    result = res["result"]
+    
+    # Validate result
+    validated = MedicalRecommendation(**result)
+    assert validated.soap is not None
+    assert len(validated.soap.subjective) > 0
+    assert len(validated.soap.objective) > 0
+    assert len(validated.soap.assessment) > 0
+    assert len(validated.soap.plan) > 0
+    assert 0.0 <= validated.confidence_score <= 1.0
+
 def test_logging_activity_check():
     """Verify that agent_activity.log has been created and has trace contents."""
     log_path = "agent_activity.log"
